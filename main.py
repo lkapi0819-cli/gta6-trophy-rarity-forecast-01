@@ -14,9 +14,9 @@ the history to its distinct snapshots, then
   * fits log N against log time-since-release and extrapolates the tracked
     pool to the target (the pool only grows; the slope is clamped at 0);
   * fits log (E_i + 0.75) against the same clock for each trophy, shrinks each
-    slope toward the pooled earner-growth slope, and extrapolates earners
-    from the last snapshot (small counts are noisy, hence the shrinkage and
-    the +0.75 continuity offset);
+    slope toward its description group's slope and then the pooled slope,
+    and extrapolates earners from the last snapshot (small counts are noisy,
+    hence the shrinkage and the +0.75 continuity offset);
   * takes the median rate as E_i(target) / N(target), so a trophy's rate
     falls when the pool grows faster than its earners and rises when its
     earners outgrow the pool — the dilution/maturation race that decides
@@ -58,14 +58,22 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
 # Spread of a rate's move, in logit units per square-root day (random walk).
-SIGMA_DAY = 0.60
+# Calibrated after the graded practice run: its 90% band covered 98% of the
+# realised rates, so the base spreads came down slightly.
+SIGMA_DAY = 0.57
 # Extra logit spread that is always present: an unseen Exophase refresh can
 # step every rate between the last read and the target.
-REFRESH_SD = 0.30
+REFRESH_SD = 0.27
+# How much extra spread a disagreement between the count model and the
+# logit model buys, per logit of disagreement (capped).
+DISAGREE_SD = 0.35
 # Flat-history (no trend visible) launch prior: median logit shift at a
-# 90-minute horizon, and the spread used there.
-FLAT_SHIFT_90M = -1.00
-FLAT_SD = 0.90
+# 90-minute horizon, and the spread used there. The graded practice refresh
+# diluted rates to about an eighth of the stale page on average — far deeper
+# than the first version's -1.0 shift assumed — so the shift deepened toward
+# the realised value (shrunk, as it rests on a single observed refresh).
+FLAT_SHIFT_90M = -1.55
+FLAT_SD = 0.82
 
 
 def clamp_rate(x: float) -> float:
@@ -216,21 +224,56 @@ def forecast_case(case, name):
         slope_logit_pool = logit_slopes[len(logit_slopes) // 2] if logit_slopes else 0.0
         slope_logit_pool = min(2.5, max(-1.5, slope_logit_pool))
 
+        # Hierarchical shrinkage targets for the earner slopes: trophies
+        # whose descriptions share a shape (the story chain, the per-NPC
+        # final missions, everything else) share a trajectory, so each
+        # group's summed-earner slope is fitted as well as the pooled one.
+        def group_of(t):
+            d = t.get("description", "")
+            if d.startswith("Complete Chapter") or d == "Complete the final mission.":
+                return "story"
+            if d.startswith("Complete the final mission for"):
+                return "sidestory"
+            return "grind"
+
+        groups = [group_of(t) for t in trophies]
+        group_slope = {}
+        for gname in set(groups):
+            gtot = []
+            for k in keep:
+                s = snaps[k]
+                tot = 0.0
+                for i in range(len(trophies)):
+                    if groups[i] != gname:
+                        continue
+                    r = s["rates"][i]
+                    if r is not None:
+                        tot += r / 100.0 * float(s["players_tracked"])
+                gtot.append(math.log(tot + 0.75))
+            gs = ols_slope(fx, gtot, fx[-1], gtot[-1])
+            group_slope[gname] = min(4.0, max(-0.5, gs))
+        shrink_g = len(keep) / (len(keep) + 2.0)
+
+        # Raw per-trophy earner slopes, before shrinkage.
+        raw_b = []
+        for i in range(len(trophies)):
+            ys = []
+            for k in keep:
+                r = snaps[k]["rates"][i]
+                e = (r / 100.0 * float(snaps[k]["players_tracked"])) if r is not None else 0.0
+                ys.append(math.log(e + 0.75))
+            bi = ols_slope(fx, ys, fx[-1], ys[-1])
+            raw_b.append(min(4.0, max(-0.5, bi)))
+
         dx = x_target - x_last
         for i in range(len(trophies)):
             r_last = last_rates[i]
             if r_last is None:
                 continue
             e_last = r_last / 100.0 * n_last
-            ys = []
-            for k in keep:
-                r = snaps[k]["rates"][i]
-                e = (r / 100.0 * float(snaps[k]["players_tracked"])) if r is not None else 0.0
-                ys.append(math.log(e + 0.75))
-            b_i = ols_slope(fx, ys, fx[-1], ys[-1])
-            b_i = min(4.0, max(-0.5, b_i))
             shrink = len(keep) / (len(keep) + 3.0)
-            b = shrink * b_i + (1.0 - shrink) * slope_pool
+            b_group = shrink_g * group_slope[groups[i]] + (1.0 - shrink_g) * slope_pool
+            b = shrink * raw_b[i] + (1.0 - shrink) * b_group
             # Damped count model: earner growth decelerates, and earners can
             # never exceed the pool that could have earned the trophy.
             log_e = math.log(e_last + 0.75) + 0.85 * b * dx
@@ -252,15 +295,20 @@ def forecast_case(case, name):
             m_logit = inv_logit(logit(r_last) + 0.75 * g * dx)
             # Blend on the logit scale: the count model reads rare trophies
             # best; the logit model keeps common trophies honest.
+            lg_count = logit(m_count)
+            lg_logit = logit(m_logit)
             w_count = 1.0 / (1.0 + math.exp((r_last - 8.0) / 6.0))
-            lg = w_count * logit(m_count) + (1.0 - w_count) * logit(m_logit)
+            lg = w_count * lg_count + (1.0 - w_count) * lg_logit
             # No median may move more than 3.2 logit from the last read:
             # beyond that the trend is an artefact, not a forecast.
             lg = min(logit(r_last) + 3.2, max(logit(r_last) - 3.2, lg))
             medians[i] = clamp_rate(inv_logit(lg))
             extra = 0.25 / math.sqrt(max(1.0, e_last))
+            # Where the two models disagree, the honest spread is wider.
+            dis = min(1.5, abs(lg_count - lg_logit))
             sigmas[i] = min(2.2, math.sqrt(
-                (SIGMA_DAY * math.sqrt(horizon_days)) ** 2 + REFRESH_SD ** 2 + extra ** 2))
+                (SIGMA_DAY * math.sqrt(horizon_days)) ** 2 + REFRESH_SD ** 2
+                + extra ** 2 + (DISAGREE_SD * dis) ** 2))
     else:
         # --- flat regime: no trend visible; apply the launch prior ---
         # The page has not refreshed inside the history, so the next refresh
